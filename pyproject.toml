@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "parcle"
+version = "0.1.0"
+description = "Long-term memory for AI agents — a Python client for the Parcle Memory API."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Parcle" }]
+keywords = ["parcle", "memory", "llm", "ai", "agents", "rag"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = ["httpx>=0.24"]
+
+[project.urls]
+Homepage = "https://parcle.ai"
+Documentation = "https://api.parcle.ai"
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "respx>=0.20"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["parcle"]

@@ -35,11 +35,20 @@ from parcle import Parcle
 client = Parcle(api_key="pk_live_...")
 
 # 1. Write a conversation into a user's memory.
-client.ingest_dialog(
+#    Ingestion is incremental: omit session_id to start a new session, then
+#    pass the returned session_id back to append more turns to the same one.
+result = client.ingest_dialog(
     user_id="ada",
     messages=[
         {"role": "user", "content": "I'm allergic to peanuts."},
         {"role": "assistant", "content": "Got it — I'll avoid peanuts in suggestions."},
+    ],
+)
+client.ingest_dialog(
+    user_id="ada",
+    session_id=result.session_id,  # append to the same session
+    messages=[
+        {"role": "user", "content": "Also, I don't eat shellfish."},
     ],
 )
 
@@ -51,5 +60,5 @@ result = client.search(user_id="ada", query="What food should I avoid?")
 
 print(result.answer)      # "You're allergic to peanuts, so avoid them."
 print(result.confidence)  # 0.92
-print(result.citations)   # [Citation(type="dialog", id="...")]
+print(result.citations)   # [Citation(type="session", id="...")]
 ```
