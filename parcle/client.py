@@ -35,6 +35,8 @@ __all__ = ["Parcle"]
 
 DEFAULT_BASE_URL = "https://api.parcle.ai"
 DEFAULT_TIMEOUT = 30.0
+DEFAULT_RETRIEVAL_TIMEOUT = 180.0
+DEFAULT_WAIT_TIMEOUT = 180.0
 DEFAULT_MAX_RETRIES = 2
 # Statuses worth retrying with backoff: rate limit, server error, unavailable.
 _RETRY_STATUS = frozenset({429, 500, 503})
@@ -82,9 +84,13 @@ class Parcle:
         Override the API base URL (e.g. for a staging environment).
     timeout:
         Per-request timeout in seconds.
+    retrieval_timeout:
+        Timeout in seconds for retrieval requests such as :meth:`search`.
+        Retrieval requests do not retry by default.
     max_retries:
-        How many times to retry a request that fails with a retryable status
-        (429/500/503) or a connection error, using exponential backoff.
+        How many times to retry safe read requests that fail with a retryable
+        status (429/500/503) or a connection error, using exponential backoff.
+        Writes, deletes, and retrieval requests do not retry by default.
     http_client:
         Bring your own configured :class:`httpx.Client` (proxies, custom
         transport, …). Its lifetime is then yours to manage.
@@ -102,6 +108,7 @@ class Parcle:
         *,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
+        retrieval_timeout: float = DEFAULT_RETRIEVAL_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         http_client: Optional[httpx.Client] = None,
     ) -> None:
@@ -113,6 +120,7 @@ class Parcle:
             )
         self.api_key = key
         self.base_url = base_url.rstrip("/")
+        self.retrieval_timeout = retrieval_timeout
         self.max_retries = max(0, int(max_retries))
 
         self._owns_client = http_client is None
@@ -139,6 +147,7 @@ class Parcle:
         *,
         name: Optional[str] = None,
         timezone: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> User:
         """Create or update a user.
 
@@ -148,7 +157,7 @@ class Parcle:
         payload = _drop_none(
             {"user_id": user_id, "name": name, "timezone": timezone}
         )
-        data = self._request("POST", "/v1/users", json_body=payload)
+        data = self._request("POST", "/v1/users", json_body=payload, timeout=timeout)
         return User.from_dict(data)
 
     # -- ingestion -------------------------------------------------------------
@@ -160,11 +169,17 @@ class Parcle:
         *,
         session_id: Optional[str] = None,
         tag: Optional[TagFilter] = None,
+        timeout: Optional[float] = None,
+        wait: bool = True,
+        wait_timeout: Optional[float] = DEFAULT_WAIT_TIMEOUT,
+        wait_poll_interval: float = 2.0,
     ) -> IngestDialogResult:
         """Append dialog messages to a user's memory.
 
         Omit ``session_id`` to start a new session; pass one to append. ``tag``
-        applies only when a new session is created.
+        applies only when a new session is created. By default, this waits
+        until the write is searchable; pass ``wait=False`` to return as soon as
+        the write has been accepted.
         """
         payload: Dict[str, Any] = {
             "user_id": user_id,
@@ -174,9 +189,20 @@ class Parcle:
         if tag is not None:
             payload["tag"] = dict(tag)
         data = self._request(
-            "POST", "/v1/memories/ingest_dialog", json_body=payload
+            "POST",
+            "/v1/memories/ingest_dialog",
+            json_body=payload,
+            timeout=timeout,
         )
-        return IngestDialogResult.from_dict(data)
+        result = IngestDialogResult.from_dict(data)
+        if wait:
+            self.wait_until_ready(
+                user_id,
+                result.event_id,
+                poll_interval=wait_poll_interval,
+                timeout=wait_timeout,
+            )
+        return result
 
     def ingest_file(
         self,
@@ -185,12 +211,18 @@ class Parcle:
         *,
         updated_at: Optional[str] = None,
         tag: Optional[TagFilter] = None,
+        timeout: Optional[float] = None,
+        wait: bool = True,
+        wait_timeout: Optional[float] = DEFAULT_WAIT_TIMEOUT,
+        wait_poll_interval: float = 2.0,
     ) -> IngestFileResult:
         """Upload a file into a user's memory.
 
         ``file`` may be a path, an open binary stream, raw ``bytes``, or a
         ``(filename, content[, content_type])`` tuple. For streams and bytes a
-        filename is required either via the stream's ``.name`` or the tuple form.
+        filename is required either via the stream's ``.name`` or the tuple
+        form. By default, this waits until the file is searchable; pass
+        ``wait=False`` to return as soon as the upload has been accepted.
         """
         filename, content, content_type = _prepare_file(file)
         files = {"file": (filename, content, content_type)}
@@ -200,18 +232,34 @@ class Parcle:
         if tag is not None:
             form["tag"] = json.dumps(tag)
         data = self._request(
-            "POST", "/v1/memories/ingest_files", files=files, data=form
+            "POST",
+            "/v1/memories/ingest_files",
+            files=files,
+            data=form,
+            timeout=timeout,
         )
-        return IngestFileResult.from_dict(data)
+        result = IngestFileResult.from_dict(data)
+        if wait:
+            self.wait_until_ready(
+                user_id,
+                result.event_id,
+                poll_interval=wait_poll_interval,
+                timeout=wait_timeout,
+            )
+        return result
 
     # -- events ----------------------------------------------------------------
 
-    def get_event(self, user_id: str, event_id: str) -> Event:
+    def get_event(
+        self, user_id: str, event_id: str, *, timeout: Optional[float] = None
+    ) -> Event:
         """Fetch the ingestion status for a single write."""
         data = self._request(
             "POST",
             "/v1/memories/events",
             json_body={"user_id": user_id, "event_id": event_id},
+            timeout=timeout,
+            max_retries=self.max_retries,
         )
         return Event.from_dict(data)
 
@@ -221,7 +269,7 @@ class Parcle:
         event_id: str,
         *,
         poll_interval: float = 2.0,
-        timeout: Optional[float] = 120.0,
+        timeout: Optional[float] = DEFAULT_WAIT_TIMEOUT,
         raise_on_failed: bool = True,
     ) -> Event:
         """Poll :meth:`get_event` until the event is ready or failed.
@@ -257,11 +305,13 @@ class Parcle:
         *,
         tag_filter: Optional[TagFilter] = None,
         timezone: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> SearchResult:
         """Ask a natural-language question over a user's memory.
 
         Returns an ``answer`` grounded in source ``citations``, with a
-        ``confidence`` in ``[0, 1]``.
+        ``confidence`` in ``[0, 1]``. Retrieval uses a longer default timeout
+        than ordinary API calls and is not retried.
         """
         payload = _drop_none(
             {
@@ -271,7 +321,13 @@ class Parcle:
                 "timezone": timezone,
             }
         )
-        data = self._request("POST", "/v1/memories/search", json_body=payload)
+        data = self._request(
+            "POST",
+            "/v1/memories/search",
+            json_body=payload,
+            timeout=self.retrieval_timeout if timeout is None else timeout,
+            max_retries=0,
+        )
         return SearchResult.from_dict(data)
 
     # -- sources & sessions ----------------------------------------------------
@@ -285,6 +341,7 @@ class Parcle:
         page: int = 1,
         limit: int = 50,
         order: str = "desc",
+        timeout: Optional[float] = None,
     ) -> SourcesPage:
         """List a user's sources (dialog sessions and files), page by page.
 
@@ -300,7 +357,13 @@ class Parcle:
                 "order": order,
             }
         )
-        data = self._request("POST", "/v1/memories/sources", json_body=payload)
+        data = self._request(
+            "POST",
+            "/v1/memories/sources",
+            json_body=payload,
+            timeout=timeout,
+            max_retries=self.max_retries,
+        )
         return SourcesPage.from_dict(data)
 
     def iter_sources(
@@ -311,6 +374,7 @@ class Parcle:
         tag_filter: Optional[TagFilter] = None,
         limit: int = 50,
         order: str = "desc",
+        timeout: Optional[float] = None,
     ):
         """Yield every source across all pages, fetching lazily."""
         page = 1
@@ -322,6 +386,7 @@ class Parcle:
                 page=page,
                 limit=limit,
                 order=order,
+                timeout=timeout,
             )
             for source in result.sources:
                 yield source
@@ -329,32 +394,48 @@ class Parcle:
                 return
             page += 1
 
-    def get_session(self, user_id: str, session_id: str) -> Session:
+    def get_session(
+        self, user_id: str, session_id: str, *, timeout: Optional[float] = None
+    ) -> Session:
         """Read a dialog session's original messages in chronological order."""
         data = self._request(
             "POST",
             "/v1/memories/sessions",
             json_body={"user_id": user_id, "session_id": session_id},
+            timeout=timeout,
+            max_retries=self.max_retries,
         )
         return Session.from_dict(data)
 
     # -- deletion --------------------------------------------------------------
 
-    def delete_by_session(self, user_id: str, session_id: str) -> DeleteResult:
+    def delete_by_session(
+        self, user_id: str, session_id: str, *, timeout: Optional[float] = None
+    ) -> DeleteResult:
         """Delete all memory derived from a dialog session."""
         return self._delete(
             "/v1/memories/by_session",
             {"user_id": user_id, "session_id": session_id},
+            timeout=timeout,
         )
 
-    def delete_by_file(self, user_id: str, file_id: str) -> DeleteResult:
+    def delete_by_file(
+        self, user_id: str, file_id: str, *, timeout: Optional[float] = None
+    ) -> DeleteResult:
         """Delete all memory derived from a file."""
         return self._delete(
             "/v1/memories/by_file",
             {"user_id": user_id, "file_id": file_id},
+            timeout=timeout,
         )
 
-    def delete_by_tag(self, user_id: str, tag_filter: TagFilter) -> DeleteResult:
+    def delete_by_tag(
+        self,
+        user_id: str,
+        tag_filter: TagFilter,
+        *,
+        timeout: Optional[float] = None,
+    ) -> DeleteResult:
         """Delete all memory whose source tags match ``tag_filter``.
 
         ``tag_filter`` must be non-empty.
@@ -364,10 +445,13 @@ class Parcle:
         return self._delete(
             "/v1/memories/by_tag",
             {"user_id": user_id, "tag_filter": dict(tag_filter)},
+            timeout=timeout,
         )
 
-    def _delete(self, path: str, body: Dict[str, Any]) -> DeleteResult:
-        data = self._request("DELETE", path, json_body=body)
+    def _delete(
+        self, path: str, body: Dict[str, Any], *, timeout: Optional[float] = None
+    ) -> DeleteResult:
+        data = self._request("DELETE", path, json_body=body, timeout=timeout)
         return DeleteResult.from_dict(data)
 
     # -- transport -------------------------------------------------------------
@@ -380,24 +464,29 @@ class Parcle:
         json_body: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
         files: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
         }
+        request_kwargs: Dict[str, Any] = {
+            "headers": headers,
+            "json": json_body,
+            "data": data,
+            "files": files,
+        }
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        effective_retries = 0 if max_retries is None else max(0, int(max_retries))
+        attempts = effective_retries + 1
 
         last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(attempts):
             try:
-                response = self._client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    json=json_body,
-                    data=data,
-                    files=files,
-                )
+                response = self._client.request(method, url, **request_kwargs)
             except httpx.TimeoutException as exc:
                 last_exc = ParcleConnectionError(f"Request to {url} timed out.")
                 last_exc.__cause__ = exc
@@ -405,13 +494,13 @@ class Parcle:
                 last_exc = ParcleConnectionError(f"Request to {url} failed: {exc}")
                 last_exc.__cause__ = exc
             else:
-                if response.status_code in _RETRY_STATUS and attempt < self.max_retries:
+                if response.status_code in _RETRY_STATUS and attempt < attempts - 1:
                     self._sleep_for_retry(response, attempt)
                     continue
                 return self._parse_response(response)
 
             # Reached only on a connection-level failure; back off and retry.
-            if attempt < self.max_retries:
+            if attempt < attempts - 1:
                 time.sleep(_backoff_seconds(attempt))
                 continue
             assert last_exc is not None

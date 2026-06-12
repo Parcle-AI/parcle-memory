@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import httpx
@@ -48,6 +49,38 @@ def test_explicit_key_beats_env(monkeypatch):
         assert c.api_key == "pk_explicit"
 
 
+def test_public_methods_accept_timeout():
+    methods = [
+        "create_user",
+        "ingest_dialog",
+        "ingest_file",
+        "get_event",
+        "wait_until_ready",
+        "search",
+        "list_sources",
+        "iter_sources",
+        "get_session",
+        "delete_by_session",
+        "delete_by_file",
+        "delete_by_tag",
+    ]
+
+    for method in methods:
+        assert "timeout" in inspect.signature(getattr(Parcle, method)).parameters
+
+
+def test_wait_until_ready_default_timeout_is_180():
+    timeout = inspect.signature(Parcle.wait_until_ready).parameters["timeout"]
+    assert timeout.default == 180.0
+
+
+def test_ingest_waits_by_default():
+    dialog_wait = inspect.signature(Parcle.ingest_dialog).parameters["wait"]
+    file_wait = inspect.signature(Parcle.ingest_file).parameters["wait"]
+    assert dialog_wait.default is True
+    assert file_wait.default is True
+
+
 # -- users ---------------------------------------------------------------------
 
 
@@ -87,6 +120,15 @@ def test_create_user_omits_none(client):
     assert json.loads(route.calls.last.request.content) == {}
 
 
+@respx.mock
+def test_create_user_timeout_override(client):
+    route = respx.post(f"{BASE}/v1/users").mock(
+        return_value=httpx.Response(200, json={"user_id": "u", "is_new": True})
+    )
+    client.create_user(timeout=45.0)
+    assert route.calls.last.request.extensions["timeout"]["read"] == 45.0
+
+
 # -- ingest dialog -------------------------------------------------------------
 
 
@@ -104,6 +146,7 @@ def test_ingest_dialog(client):
             parcle.Message(role="assistant", content="hello", speaker="bot"),
         ],
         tag={"app": "x"},
+        wait=False,
     )
     assert result.session_id == "sess_1"
     assert result.event_id == "evt_1"
@@ -125,6 +168,79 @@ def test_ingest_dialog_bad_message(client):
         client.ingest_dialog(user_id="ada", messages=[{"role": "user"}])
 
 
+@respx.mock
+def test_ingest_dialog_timeout_override(client):
+    route = respx.post(f"{BASE}/v1/memories/ingest_dialog").mock(
+        return_value=httpx.Response(
+            200, json={"session_id": "sess_1", "event_id": "evt_1"}
+        )
+    )
+    client.ingest_dialog(
+        user_id="ada",
+        messages=[{"role": "user", "content": "hi"}],
+        timeout=60.0,
+        wait=False,
+    )
+    assert route.calls.last.request.extensions["timeout"]["read"] == 60.0
+
+
+@respx.mock
+def test_ingest_dialog_waits_by_default(client):
+    ingest_route = respx.post(f"{BASE}/v1/memories/ingest_dialog").mock(
+        return_value=httpx.Response(
+            200, json={"session_id": "sess_1", "event_id": "evt_1"}
+        )
+    )
+    event_route = respx.post(f"{BASE}/v1/memories/events").mock(
+        return_value=httpx.Response(
+            200, json={"event_id": "evt_1", "status": "ready", "error": None}
+        )
+    )
+
+    result = client.ingest_dialog(
+        user_id="ada",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert result.session_id == "sess_1"
+    assert ingest_route.call_count == 1
+    assert event_route.call_count == 1
+
+
+@respx.mock
+def test_ingest_dialog_wait_options(client, monkeypatch):
+    captured = {}
+
+    def fake_wait(user_id, event_id, *, poll_interval=2.0, timeout=180.0, **_):
+        captured.update(
+            user_id=user_id,
+            event_id=event_id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(client, "wait_until_ready", fake_wait)
+    respx.post(f"{BASE}/v1/memories/ingest_dialog").mock(
+        return_value=httpx.Response(
+            200, json={"session_id": "sess_1", "event_id": "evt_1"}
+        )
+    )
+
+    client.ingest_dialog(
+        user_id="ada",
+        messages=[{"role": "user", "content": "hi"}],
+        wait_timeout=45.0,
+        wait_poll_interval=0.5,
+    )
+
+    assert captured == {
+        "user_id": "ada",
+        "event_id": "evt_1",
+        "poll_interval": 0.5,
+        "timeout": 45.0,
+    }
+
+
 # -- ingest file ---------------------------------------------------------------
 
 
@@ -137,7 +253,7 @@ def test_ingest_file_from_path(client, tmp_path):
             200, json={"file_id": "file_1", "event_id": "evt_2"}
         )
     )
-    result = client.ingest_file("ada", str(f), tag={"source": "notes"})
+    result = client.ingest_file("ada", str(f), tag={"source": "notes"}, wait=False)
     assert result.file_id == "file_1"
 
     req = route.calls.last.request
@@ -155,8 +271,30 @@ def test_ingest_file_from_tuple(client):
             200, json={"file_id": "file_2", "event_id": "evt_3"}
         )
     )
-    result = client.ingest_file("ada", ("data.txt", b"raw bytes"))
+    result = client.ingest_file("ada", ("data.txt", b"raw bytes"), wait=False)
     assert result.file_id == "file_2"
+
+
+@respx.mock
+def test_ingest_file_waits_by_default(client, tmp_path):
+    f = tmp_path / "notes.md"
+    f.write_text("# hello")
+    ingest_route = respx.post(f"{BASE}/v1/memories/ingest_files").mock(
+        return_value=httpx.Response(
+            200, json={"file_id": "file_1", "event_id": "evt_2"}
+        )
+    )
+    event_route = respx.post(f"{BASE}/v1/memories/events").mock(
+        return_value=httpx.Response(
+            200, json={"event_id": "evt_2", "status": "ready", "error": None}
+        )
+    )
+
+    result = client.ingest_file("ada", str(f))
+
+    assert result.file_id == "file_1"
+    assert ingest_route.call_count == 1
+    assert event_route.call_count == 1
 
 
 def test_ingest_file_missing_path(client):
@@ -182,6 +320,17 @@ def test_get_event(client):
     event = client.get_event("ada", "evt_1")
     assert event.status == "processing"
     assert not event.is_terminal
+
+
+@respx.mock
+def test_get_event_timeout_override(client):
+    route = respx.post(f"{BASE}/v1/memories/events").mock(
+        return_value=httpx.Response(
+            200, json={"event_id": "evt_1", "status": "processing", "error": None}
+        )
+    )
+    client.get_event("ada", "evt_1", timeout=15.0)
+    assert route.calls.last.request.extensions["timeout"]["read"] == 15.0
 
 
 @respx.mock
@@ -249,6 +398,70 @@ def test_search_omits_optional(client):
     sent = json.loads(route.calls.last.request.content)
     assert "tag_filter" not in sent
     assert "timezone" not in sent
+
+
+@respx.mock
+def test_search_uses_retrieval_timeout():
+    route = respx.post(f"{BASE}/v1/memories/search").mock(
+        return_value=httpx.Response(
+            200, json={"answer": "a", "confidence": 0.1, "citations": []}
+        )
+    )
+    with Parcle(api_key="pk_test", retrieval_timeout=180.0) as c:
+        c.search("ada", "q")
+
+    assert route.calls.last.request.extensions["timeout"]["read"] == 180.0
+
+
+@respx.mock
+def test_search_timeout_override():
+    route = respx.post(f"{BASE}/v1/memories/search").mock(
+        return_value=httpx.Response(
+            200, json={"answer": "a", "confidence": 0.1, "citations": []}
+        )
+    )
+    with Parcle(api_key="pk_test", retrieval_timeout=180.0) as c:
+        c.search("ada", "q", timeout=45.0)
+
+    assert route.calls.last.request.extensions["timeout"]["read"] == 45.0
+
+
+@respx.mock
+def test_search_does_not_retry(monkeypatch):
+    monkeypatch.setattr(parcle.client.time, "sleep", lambda *_: None)
+    route = respx.post(f"{BASE}/v1/memories/search").mock(
+        side_effect=[
+            httpx.Response(
+                503, json={"error": {"code": "unavailable", "message": "down"}}
+            ),
+            httpx.Response(
+                200, json={"answer": "a", "confidence": 0.5, "citations": []}
+            ),
+        ]
+    )
+    with Parcle(api_key="pk_test", max_retries=2) as c:
+        with pytest.raises(parcle.ServiceUnavailableError):
+            c.search("ada", "q")
+
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_ingest_dialog_does_not_retry(monkeypatch):
+    monkeypatch.setattr(parcle.client.time, "sleep", lambda *_: None)
+    route = respx.post(f"{BASE}/v1/memories/ingest_dialog").mock(
+        side_effect=[
+            httpx.Response(
+                503, json={"error": {"code": "unavailable", "message": "down"}}
+            ),
+            httpx.Response(200, json={"session_id": "sess_1", "event_id": "evt_1"}),
+        ]
+    )
+    with Parcle(api_key="pk_test", max_retries=2) as c:
+        with pytest.raises(parcle.ServiceUnavailableError):
+            c.ingest_dialog("ada", [{"role": "user", "content": "hi"}])
+
+    assert route.call_count == 1
 
 
 # -- sources & sessions --------------------------------------------------------
@@ -344,6 +557,15 @@ def test_delete_by_session(client):
 
 
 @respx.mock
+def test_delete_by_session_timeout_override(client):
+    route = respx.delete(f"{BASE}/v1/memories/by_session").mock(
+        return_value=httpx.Response(200, json={"deleted": True, "deleted_count": 3})
+    )
+    client.delete_by_session("ada", "sess_1", timeout=90.0)
+    assert route.calls.last.request.extensions["timeout"]["read"] == 90.0
+
+
+@respx.mock
 def test_delete_by_tag(client):
     respx.delete(f"{BASE}/v1/memories/by_tag").mock(
         return_value=httpx.Response(200, json={"deleted": True, "deleted_count": 42})
@@ -411,22 +633,24 @@ def test_retries_then_succeeds(monkeypatch):
     monkeypatch.setattr(parcle.client.time, "sleep", lambda *_: None)
     responses = [
         httpx.Response(503, json={"error": {"code": "unavailable", "message": "down"}}),
-        httpx.Response(200, json={"answer": "a", "confidence": 0.5, "citations": []}),
+        httpx.Response(200, json={"session_id": "sess_1", "tag": {}, "messages": []}),
     ]
-    respx.post(f"{BASE}/v1/memories/search").mock(side_effect=responses)
+    respx.post(f"{BASE}/v1/memories/sessions").mock(side_effect=responses)
     with Parcle(api_key="pk_test", max_retries=2) as c:
-        result = c.search("ada", "q")
-    assert result.answer == "a"
+        result = c.get_session("ada", "sess_1")
+    assert result.session_id == "sess_1"
 
 
 @respx.mock
-def test_retries_exhausted_raises(monkeypatch):
+def test_read_retries_exhausted_raises(monkeypatch):
     monkeypatch.setattr(parcle.client.time, "sleep", lambda *_: None)
-    respx.post(f"{BASE}/v1/memories/search").mock(
+    route = respx.post(f"{BASE}/v1/memories/sessions").mock(
         return_value=httpx.Response(
             429, json={"error": {"code": "rate_limited", "message": "slow down"}}
         )
     )
     with Parcle(api_key="pk_test", max_retries=1) as c:
         with pytest.raises(RateLimitError):
-            c.search("ada", "q")
+            c.get_session("ada", "sess_1")
+
+    assert route.call_count == 2
