@@ -12,6 +12,7 @@ from typing import Any, Dict, IO, List, Mapping, Optional, Sequence, Tuple, Unio
 import httpx
 
 from .exceptions import (
+    FileTooLargeError,
     ParcleAPIError,
     ParcleConfigError,
     ParcleConnectionError,
@@ -40,6 +41,12 @@ DEFAULT_WAIT_TIMEOUT = 180.0
 DEFAULT_MAX_RETRIES = 2
 # Statuses worth retrying with backoff: rate limit, server error, unavailable.
 _RETRY_STATUS = frozenset({429, 500, 503})
+
+# Upload size ceiling, mirroring the server's limit. Files above this are
+# rejected client-side before any request is sent. The server still enforces
+# the same limit with HTTP 413 for cases we can't measure locally.
+MAX_FILE_SIZE_MB = 10
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 # Content types for the supported upload extensions, filling gaps left by the
 # stdlib's ``mimetypes`` (which does not know markdown, for example).
@@ -223,8 +230,20 @@ class Parcle:
         filename is required either via the stream's ``.name`` or the tuple
         form. By default, this waits until the file is searchable; pass
         ``wait=False`` to return as soon as the upload has been accepted.
+
+        Files larger than ``MAX_FILE_SIZE_MB`` MB are rejected with
+        :class:`~parcle.exceptions.FileTooLargeError` before any request is
+        sent (when the size can be measured locally).
         """
         filename, content, content_type = _prepare_file(file)
+        size = _content_size(content)
+        if size is not None and size > MAX_FILE_SIZE_BYTES:
+            raise FileTooLargeError(
+                f"File {filename!r} is {size} bytes, which exceeds the "
+                f"{MAX_FILE_SIZE_MB} MB upload limit.",
+                status_code=413,
+                code="file_too_large",
+            )
         files = {"file": (filename, content, content_type)}
         form: Dict[str, Any] = {"user_id": user_id}
         if updated_at is not None:
@@ -312,6 +331,12 @@ class Parcle:
         Returns an ``answer`` grounded in source ``citations``, with a
         ``confidence`` in ``[0, 1]``. Retrieval uses a longer default timeout
         than ordinary API calls and is not retried.
+
+        Retrieval is delivered as a Server-Sent Events stream: the server may
+        take longer than a CDN's idle limit, so it emits keepalives until the
+        answer is ready. This is handled transparently — the streaming is an
+        implementation detail and the call still returns a single
+        :class:`~parcle.models.SearchResult`.
         """
         payload = _drop_none(
             {
@@ -321,14 +346,112 @@ class Parcle:
                 "timezone": timezone,
             }
         )
-        data = self._request(
-            "POST",
-            "/v1/memories/search",
-            json_body=payload,
+        data = self._stream_search(
+            payload,
             timeout=self.retrieval_timeout if timeout is None else timeout,
-            max_retries=0,
         )
         return SearchResult.from_dict(data)
+
+    def _stream_search(
+        self, payload: Dict[str, Any], *, timeout: Optional[float]
+    ) -> Dict[str, Any]:
+        """Run the SSE search and return the decoded ``final`` event payload.
+
+        Failures from the synchronous ``prepare`` phase arrive as a normal
+        non-2xx HTTP response (with their real status code) and are translated
+        by :meth:`_parse_response`. Once the stream has started the status is
+        fixed at 200, so failures from the long ``run`` phase arrive in-band as
+        an ``error`` event and become a :class:`~parcle.exceptions.ParcleAPIError`.
+        """
+        url = f"{self.base_url}/v1/memories/search"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "text/event-stream",
+        }
+        request_kwargs: Dict[str, Any] = {"headers": headers, "json": payload}
+        if timeout is not None:
+            # httpx resets its read timeout on every chunk, so the periodic
+            # keepalive would otherwise keep the connection open indefinitely.
+            # Two guards bound the call: httpx's read timeout catches a fully
+            # silent (stalled) connection, while the wall-clock deadline below
+            # caps an alive-but-slow search that keeps sending keepalives. The
+            # deadline is only checked between received lines, so it fires
+            # within roughly one keepalive interval of expiring.
+            request_kwargs["timeout"] = timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        try:
+            with self._client.stream("POST", url, **request_kwargs) as response:
+                if not response.is_success:
+                    response.read()
+                    return self._parse_response(response)
+
+                event_name: Optional[str] = None
+                data_lines: List[str] = []
+                for line in response.iter_lines():
+                    if deadline is not None and time.monotonic() >= deadline:
+                        # Match the non-streaming timeout path, which surfaces a
+                        # connection-level timeout as ParcleConnectionError.
+                        raise ParcleConnectionError(
+                            f"Request to {url} timed out."
+                        )
+                    if line == "":
+                        if data_lines:
+                            result = self._handle_search_event(event_name, data_lines)
+                            if result is not None:
+                                return result
+                        event_name = None
+                        data_lines = []
+                        continue
+                    if line.startswith(":"):
+                        continue  # comment line (keepalive); ignore
+                    if line.startswith("event:"):
+                        event_name = line[len("event:") :].strip()
+                    elif line.startswith("data:"):
+                        # SSE strips at most one leading space after the colon.
+                        chunk = line[len("data:") :]
+                        if chunk.startswith(" "):
+                            chunk = chunk[1:]
+                        data_lines.append(chunk)
+        except httpx.TimeoutException as exc:
+            err = ParcleConnectionError(f"Request to {url} timed out.")
+            err.__cause__ = exc
+            raise err
+        except httpx.HTTPError as exc:
+            err = ParcleConnectionError(f"Request to {url} failed: {exc}")
+            err.__cause__ = exc
+            raise err
+
+        raise ParcleConnectionError(
+            "Search stream ended before delivering a result."
+        )
+
+    @staticmethod
+    def _handle_search_event(
+        event_name: Optional[str], data_lines: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Dispatch one SSE event; return the ``final`` payload or raise on error.
+
+        Returns ``None`` for events that are neither ``final`` nor ``error`` so
+        the caller keeps reading.
+        """
+        raw = "\n".join(data_lines)
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+
+        if event_name == "error":
+            payload = data if isinstance(data, dict) else {}
+            raise ParcleAPIError(
+                payload.get("message") or "Search failed.",
+                code=payload.get("code"),
+                request_id=payload.get("request_id"),
+                body=payload or None,
+            )
+        if event_name == "final":
+            return data if isinstance(data, dict) else {}
+        return None
 
     # -- sources & sessions ----------------------------------------------------
 
@@ -573,6 +696,29 @@ def _guess_content_type(filename: str) -> str:
         return _EXTRA_CONTENT_TYPES[suffix]
     guessed, _ = mimetypes.guess_type(filename)
     return guessed or "application/octet-stream"
+
+
+def _content_size(content: Union[bytes, IO[bytes]]) -> Optional[int]:
+    """Best-effort byte length of upload content, or ``None`` if unknown.
+
+    Bytes are measured directly; a seekable stream is measured without
+    consuming it (seek to end, then restore the position). Non-seekable streams
+    return ``None`` so the upload proceeds and the server enforces the limit.
+    """
+    if isinstance(content, (bytes, bytearray)):
+        return len(content)
+    seek = getattr(content, "seek", None)
+    tell = getattr(content, "tell", None)
+    if not callable(seek) or not callable(tell):
+        return None
+    try:
+        pos = tell()
+        seek(0, os.SEEK_END)
+        size = tell()
+        seek(pos)
+    except (OSError, ValueError):
+        return None
+    return size
 
 
 def _prepare_file(

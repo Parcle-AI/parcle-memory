@@ -2,10 +2,10 @@
 
 # Parcle
 
-**Long-term memory for AI agents**
+**Sync for AI agents**
 
-Ingest conversations and files, then ask questions in natural language and get
-cited answers back. Give every user a private, persistent agent memory.
+Parcle keeps the AI coding agents you use in sync. Three things travel with you:
+**memory**, **skills**, and **conversations** — so switching agents doesn't mean starting over.
 
 <p>
   <a href="https://pypi.org/project/parcle/"><img alt="PyPI" src="https://img.shields.io/pypi/v/parcle"></a>
@@ -18,12 +18,21 @@ cited answers back. Give every user a private, persistent agent memory.
 
 ## Why Parcle?
 
-LLMs forget everything between calls. Parcle gives every user a private memory you
-can write to and search:
+Your work is spread across agents — Claude Code, Codex, Cursor — and across
+machines. Parcle is built to sync what matters between them:
 
-- 🧠 **Per-user memory** — scope everything to a `user_id`.
-- 💬 **Ingest anything** — chat transcripts and files (PDF, Markdown, text, …) go in the same place.
-- 🔎 **Ask, don't query** — search returns a synthesized **answer** with **citations**, not just raw chunks.
+- 🧠 **Memory** — a private, per-user long-term memory in the cloud. Write
+  conversations and files into it, then **ask** instead of query and get a
+  synthesized answer with citations.
+- 🛠️ **Skills** — a local library of `SKILL.md` skill folders. `push` a skill
+  from one agent and `pull` it into the others, so every agent shares the same
+  capabilities.
+- 💬 **Conversations** — collect every agent's chat transcript into one unified,
+  local format you own.
+
+**Memory** is a cloud API used through the `Parcle` client below. **Skills** and
+**conversations** are local and multi-agent, driven by the `Sync` Python entry
+point — no cloud, nothing leaves your machine.
 
 ## Installation
 
@@ -31,7 +40,7 @@ can write to and search:
 pip install parcle
 ```
 
-## Quickstart
+## Memory — quickstart
 
 ```python
 from parcle import Parcle
@@ -69,3 +78,43 @@ print(result.answer)      # "You're allergic to peanuts, so avoid them."
 print(result.confidence)  # 0.92
 print(result.citations)   # [Citation(type='session', id='...')]
 ```
+
+## Skills & conversations — local sync
+
+`Sync` is the local entry point — no API key, no cloud. Everything lives under
+`~/.parcle` (override with `PARCLE_HOME`). Constructing `Sync()` starts a
+background daemon that backfills once, then watches your agents
+
+```python
+from parcle import Sync
+from parcle.sync import get_agent
+
+sync = Sync()                  # starts the background daemon
+sync.wait_until_ready()        # wait for the initial backfill
+
+# Skills: see who holds what, move one from claude to codex, then clean up.
+sync.inventory()                              # {agent_type: [Skill, ...]}
+sync.skills.push("my-skill", get_agent("claude"))   # agent -> library
+sync.skills.pull("my-skill", get_agent("codex"))    # library -> one agent (force=True to overwrite)
+sync.list_skills()                            # what's in the library
+sync.skills.uninstall("my-skill", get_agent("codex"))
+sync.skills.remove("my-skill")
+
+# Conversations: collected incrementally; read them back to hand off between agents.
+convos = sync.list_conversations()            # [{agent_type, session_id, title, turn_count}, ...]
+for turn in sync.get_conversation("claude", convos[0]["session_id"]):
+    print(f"#{turn.seq} {turn.render()}")
+
+# Keep the background daemon alive so it goes on syncing
+try:
+    while True:
+        time.sleep(60)
+        print(sync.status())
+except KeyboardInterrupt:
+    sync.stop()
+
+sync.stop()                    
+```
+
+Supported agents: **Claude Code** & **Codex** (skills + conversations), **Cursor**
+& **OpenClaw** (skills).

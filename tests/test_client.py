@@ -12,12 +12,14 @@ import respx
 import parcle
 from parcle import (
     AuthenticationError,
+    FileTooLargeError,
     NotFoundError,
     Parcle,
     ParcleConfigError,
     RateLimitError,
     ValidationError,
 )
+from parcle.client import MAX_FILE_SIZE_BYTES
 
 BASE = "https://api.parcle.ai"
 
@@ -307,6 +309,65 @@ def test_ingest_file_raw_bytes_rejected(client):
         client.ingest_file("ada", b"no filename here")
 
 
+@respx.mock
+def test_ingest_file_too_large_bytes_no_request(client):
+    route = respx.post(f"{BASE}/v1/memories/ingest_files")
+    oversized = b"x" * (MAX_FILE_SIZE_BYTES + 1)
+    with pytest.raises(FileTooLargeError) as excinfo:
+        client.ingest_file("ada", ("big.txt", oversized))
+    assert excinfo.value.status_code == 413
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_ingest_file_too_large_path_no_request(client, tmp_path):
+    route = respx.post(f"{BASE}/v1/memories/ingest_files")
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"x" * (MAX_FILE_SIZE_BYTES + 1))
+    with pytest.raises(FileTooLargeError):
+        client.ingest_file("ada", str(f))
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_ingest_file_at_limit_is_allowed(client):
+    route = respx.post(f"{BASE}/v1/memories/ingest_files").mock(
+        return_value=httpx.Response(
+            200, json={"file_id": "file_ok", "event_id": "evt_ok"}
+        )
+    )
+    at_limit = b"x" * MAX_FILE_SIZE_BYTES
+    result = client.ingest_file("ada", ("edge.txt", at_limit), wait=False)
+    assert result.file_id == "file_ok"
+    assert route.call_count == 1
+
+
+def test_content_size_seekable_stream_is_measured_and_restored():
+    import io
+
+    from parcle.client import _content_size
+
+    stream = io.BytesIO(b"x" * 1234)
+    stream.seek(5)  # a non-zero starting position must be preserved
+    assert _content_size(stream) == 1234
+    assert stream.tell() == 5
+
+
+def test_content_size_unseekable_stream_returns_none():
+    from parcle.client import _content_size
+
+    class _Unseekable:
+        def seek(self, *args):
+            raise OSError("not seekable")
+
+        def tell(self):
+            raise OSError("not seekable")
+
+    # Unknown size means the client cannot block locally; the server's HTTP 413
+    # remains the backstop for such streams.
+    assert _content_size(_Unseekable()) is None
+
+
 # -- events & polling ----------------------------------------------------------
 
 
@@ -362,16 +423,36 @@ def test_wait_until_ready_failed_raises(client, monkeypatch):
 # -- search --------------------------------------------------------------------
 
 
+def _sse_event(name, data):
+    """One SSE event block, mirroring the server's ``format_sse``."""
+    return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+
+# An SSE keepalive comment line, emitted by the server between heartbeats.
+_SSE_KEEPALIVE = ": keepalive\n\n"
+
+
+def _sse_response(*chunks, status=200):
+    """A streaming ``text/event-stream`` response built from raw SSE chunks."""
+    return httpx.Response(
+        status,
+        text="".join(chunks),
+        headers={"content-type": "text/event-stream"},
+    )
+
+
 @respx.mock
 def test_search(client):
     route = respx.post(f"{BASE}/v1/memories/search").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "answer": "You are allergic to peanuts.",
-                "confidence": 0.92,
-                "citations": [{"type": "session", "id": "sess_1"}],
-            },
+        return_value=_sse_response(
+            _sse_event(
+                "final",
+                {
+                    "answer": "You are allergic to peanuts.",
+                    "confidence": 0.92,
+                    "citations": [{"type": "session", "id": "sess_1"}],
+                },
+            )
         )
     )
     result = client.search(
@@ -388,10 +469,71 @@ def test_search(client):
 
 
 @respx.mock
+def test_search_ignores_keepalives_before_final(client):
+    """Heartbeat comment lines preceding the answer are ignored."""
+    respx.post(f"{BASE}/v1/memories/search").mock(
+        return_value=_sse_response(
+            _SSE_KEEPALIVE,
+            _SSE_KEEPALIVE,
+            _sse_event("final", {"answer": "ok", "confidence": 0.5, "citations": []}),
+        )
+    )
+    result = client.search("ada", "q")
+    assert result.answer == "ok"
+
+
+@respx.mock
+def test_search_in_band_error(client):
+    """A run-phase failure arrives as an in-band ``error`` event (HTTP 200)."""
+    respx.post(f"{BASE}/v1/memories/search").mock(
+        return_value=_sse_response(
+            _SSE_KEEPALIVE,
+            _sse_event(
+                "error",
+                {
+                    "code": "prompt_injection_detected",
+                    "message": "blocked",
+                    "request_id": "req_abc",
+                },
+            ),
+        )
+    )
+    with pytest.raises(parcle.ParcleAPIError) as exc_info:
+        client.search("ada", "q")
+    err = exc_info.value
+    assert err.code == "prompt_injection_detected"
+    assert err.message == "blocked"
+    assert err.request_id == "req_abc"
+
+
+@respx.mock
+def test_search_stream_ends_without_final(client):
+    """A stream that closes before delivering a result is a connection error."""
+    respx.post(f"{BASE}/v1/memories/search").mock(
+        return_value=_sse_response(_SSE_KEEPALIVE)
+    )
+    with pytest.raises(parcle.ParcleConnectionError):
+        client.search("ada", "q")
+
+
+@respx.mock
+def test_search_prepare_error_keeps_status(client):
+    """A pre-stream failure keeps its real HTTP status and typed exception."""
+    respx.post(f"{BASE}/v1/memories/search").mock(
+        return_value=httpx.Response(
+            404, json={"error": {"code": "user_not_found", "message": "no user"}}
+        )
+    )
+    with pytest.raises(NotFoundError) as exc_info:
+        client.search("ada", "q")
+    assert exc_info.value.status_code == 404
+
+
+@respx.mock
 def test_search_omits_optional(client):
     route = respx.post(f"{BASE}/v1/memories/search").mock(
-        return_value=httpx.Response(
-            200, json={"answer": "a", "confidence": 0.1, "citations": []}
+        return_value=_sse_response(
+            _sse_event("final", {"answer": "a", "confidence": 0.1, "citations": []})
         )
     )
     client.search("ada", "q")
@@ -403,8 +545,8 @@ def test_search_omits_optional(client):
 @respx.mock
 def test_search_uses_retrieval_timeout():
     route = respx.post(f"{BASE}/v1/memories/search").mock(
-        return_value=httpx.Response(
-            200, json={"answer": "a", "confidence": 0.1, "citations": []}
+        return_value=_sse_response(
+            _sse_event("final", {"answer": "a", "confidence": 0.1, "citations": []})
         )
     )
     with Parcle(api_key="pk_test", retrieval_timeout=180.0) as c:
@@ -416,8 +558,8 @@ def test_search_uses_retrieval_timeout():
 @respx.mock
 def test_search_timeout_override():
     route = respx.post(f"{BASE}/v1/memories/search").mock(
-        return_value=httpx.Response(
-            200, json={"answer": "a", "confidence": 0.1, "citations": []}
+        return_value=_sse_response(
+            _sse_event("final", {"answer": "a", "confidence": 0.1, "citations": []})
         )
     )
     with Parcle(api_key="pk_test", retrieval_timeout=180.0) as c:
@@ -434,8 +576,8 @@ def test_search_does_not_retry(monkeypatch):
             httpx.Response(
                 503, json={"error": {"code": "unavailable", "message": "down"}}
             ),
-            httpx.Response(
-                200, json={"answer": "a", "confidence": 0.5, "citations": []}
+            _sse_response(
+                _sse_event("final", {"answer": "a", "confidence": 0.5, "citations": []})
             ),
         ]
     )

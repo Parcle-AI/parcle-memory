@@ -1,7 +1,12 @@
-"""Parcle — long-term memory for AI agents.
+"""Parcle — sync for AI agents.
 
-Ingest conversations and files into a per-user memory, then ask questions in
-natural language and get cited answers back.
+Parcle keeps the AI agents you use in sync. Three things travel with you:
+
+* **Memory** — a cloud, per-user long-term memory: ingest conversations and
+  files, then ask questions in natural language and get cited answers back
+  (this module; see :class:`Parcle`).
+* **Skills** and **Conversations** — local, multi-agent sync through the
+  :class:`~parcle.sync.Sync` entry point; see :mod:`parcle.sync`.
 
     from parcle import Parcle
 
@@ -43,11 +48,13 @@ from .models import (
     SourcesPage,
     User,
 )
+from .sync import Sync
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "Parcle",
+    "Sync",
     "__version__",
     # models
     "Citation",
