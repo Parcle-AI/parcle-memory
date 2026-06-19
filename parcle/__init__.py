@@ -5,7 +5,7 @@ natural language and get cited answers back.
 
     from parcle import Parcle
 
-    client = Parcle(api_key="pk_live_...")
+    client = Parcle(api_key="pmem_...")
     client.ingest_dialog(user_id="ada", messages=[{"role": "user", "content": "..."}])
     result = client.search(user_id="ada", query="What food should I avoid?")
     print(result.answer, result.confidence, result.citations)
@@ -44,7 +44,7 @@ from .models import (
     User,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "Parcle",

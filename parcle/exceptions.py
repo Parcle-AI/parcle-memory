@@ -90,7 +90,7 @@ class NotFoundError(ParcleAPIError):
 
 
 class FileTooLargeError(ParcleAPIError):
-    """HTTP 413 — uploaded file exceeds the size limit."""
+    """HTTP 413 — uploaded file exceeds the size limit (10 MB)."""
 
 
 class UnsupportedFileTypeError(ParcleAPIError):

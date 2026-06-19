@@ -37,7 +37,7 @@ pip install parcle
 from parcle import Parcle
 
 # Reads PARCLE_API_KEY from the environment if api_key is omitted.
-client = Parcle(api_key="pk_live_...")
+client = Parcle(api_key="pmem_...")
 
 # 1. Write a conversation into a user's memory.
 #    Ingestion is incremental: omit session_id to start a new session, then
