@@ -25,6 +25,8 @@ can write to and search:
 - 💬 **Ingest anything** — chat transcripts and files (PDF, Markdown, text, …) go in the same place.
 - 🔎 **Ask, don't query** — search returns a synthesized **answer** with **citations**, not just raw chunks.
 
+👉 **[Learn more about agent memory →](https://parcle.ai/agent-continuity-lp)**
+
 ## Installation
 
 ```bash
@@ -39,7 +41,11 @@ from parcle import Parcle
 # Reads PARCLE_API_KEY from the environment if api_key is omitted.
 client = Parcle(api_key="pmem_...")
 
-# 1. Write a conversation into a user's memory.
+# 1. Create the user you'll be storing memory for. Do this once per user
+#    before ingesting. Pass your own user_id, or omit it to have one generated.
+client.create_user(user_id="name")
+
+# 2. Write a conversation into a user's memory.
 #    Ingestion is incremental: omit session_id to start a new session, then
 #    pass the returned session_id back to append more turns to the same one.
 dialog = client.ingest_dialog(
@@ -57,12 +63,12 @@ client.ingest_dialog(
     ],
 )
 
-# 2. ...or ingest a file (PDF, Markdown, text, …).
+# 3. ...or ingest a file (PDF, Markdown, text, …).
 client.ingest_file(user_id="ada", file="diet-notes.pdf")
 
 # Ingestion waits until content is searchable by default. Pass wait=False if you want to enqueue writes and call wait_until_ready(...) yourself.
 
-# 3. Ask a question. You get an answer with confidence and citations.
+# 4. Ask a question. You get an answer with confidence and citations.
 result = client.search(user_id="ada", query="What food should I avoid?")
 
 print(result.answer)      # "You're allergic to peanuts, so avoid them."
