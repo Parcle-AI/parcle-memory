@@ -33,7 +33,13 @@ can write to and search:
 pip install parcle
 ```
 
-## Quickstart
+## REST API
+
+Not using Python? You can call Parcle from any language over HTTP.
+See the **[REST API Reference](docs/rest-api-reference.md)** for endpoints,
+request/response schemas, and examples in curl and JavaScript.
+
+## Quickstart (Python SDK)
 
 ```python
 from parcle import Parcle
